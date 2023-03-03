@@ -1,6 +1,7 @@
 import collections
-import torch
 import enum
+
+import torch
 
 num_filters = 2
 num_blocks = 8
