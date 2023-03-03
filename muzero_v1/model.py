@@ -188,12 +188,12 @@ def train_network(config, storage, replay_buffer, device='cpu'):
             if i % config.checkpoint_interval == 0 and i > 0:
                 storage.save_network(i, network)
                 # Test against random agent
-                vs_random_once = vs_random(network)
+                vs_random_once = vs_random(config, network)
                 print('network_vs_random = ', sorted(vs_random_once.items()), end='\n')
-                vs_older = latest_vs_older(storage.latest_network(), storage.old_network())
+                vs_older = latest_vs_older(config, storage.latest_network(), storage.old_network())
                 print('lastnet_vs_older = ', sorted(vs_older.items()), end='\n')
             batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
-            update_weights(batch, network, optimizer)
+            update_weights(batch, network, optimizer, device=device)
         storage.save_network(config.training_steps, network)
 
 
@@ -230,4 +230,4 @@ def update_weights(batch, network, optimizer, device='cpu'):
 
 def make_uniform_network(config, device):
     # return Network(make_connect4_config().action_space_size).to(device)
-    return Network(config.action_space_size).to(device)
+    return Network(config.action_space_size, device=device)
