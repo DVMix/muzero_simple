@@ -26,7 +26,11 @@ class ReplayBuffer(object):
 
     def sample_game(self):
         # Sample game from buffer either uniformly or according to some priority.
-        return numpy.random.choice(self.buffer)
+        try:
+            return numpy.random.choice(self.buffer)
+        except:
+            print('achtung!')
+            return numpy.random.choice(self.buffer)
 
     def sample_position(self, game):
         # Sample position from game either uniformly or according to some priority.
