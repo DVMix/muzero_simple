@@ -11,8 +11,9 @@ from muzero_v1.config import MuZeroConfig, make_board_game_config
 from muzero_v1.game import run_selfplay
 from muzero_v1.model import train_network
 from muzero_v1.replay_buffer import ReplayBuffer
-from muzero_v1.storage import SharedStorage, random_vs_random
+from muzero_v1.storage import SharedStorage
 from muzero_v1.utils import launch_job
+from muzero_v1.mode import random_vs_random
 
 
 def make_connect4_config() -> MuZeroConfig:

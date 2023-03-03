@@ -4,7 +4,7 @@ import numpy
 
 from .action import Action, ActionHistory, Node
 from .globals_ import Player
-from .storage import add_exploration_noise, expand_node, run_mcts, select_action
+from .mode import add_exploration_noise, expand_node, run_mcts, select_action
 
 
 class Game(object):
