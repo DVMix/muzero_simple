@@ -63,6 +63,8 @@ class MuZeroConfig(object):
 
 
 def make_board_game_config(
+        batch_size: int,
+        num_actors: int,
         action_space_size: int,
         max_moves: int,
         dirichlet_alpha: float,
@@ -80,9 +82,9 @@ def make_board_game_config(
         discount=1.0,
         dirichlet_alpha=dirichlet_alpha,
         num_simulations=10,
-        batch_size=64,
+        batch_size=batch_size,
         td_steps=max_moves,  # Always use Monte Carlo return.
-        num_actors=1,
+        num_actors=num_actors,
         lr_init=lr_init,
         lr_decay_steps=400e3,
         visit_softmax_temperature_fn=visit_softmax_temperature,
