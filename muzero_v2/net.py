@@ -1,4 +1,6 @@
+import os
 import typing
+from hashlib import sha1
 from typing import Dict, List
 
 import numpy
@@ -23,7 +25,7 @@ class Conv(nn.Module):
         self.activation = activation()
         self.bn = batch_norm(out_channels)
 
-    def forward(self, x):
+    def forward(self, x, activation=True):
         h = self.conv(x)
         h = self.activation(h)
         h = self.bn(h)
@@ -39,18 +41,14 @@ class ResidualBlock(nn.Module):
         self.conv_dwc = Conv(
             in_channels, out_channels, kernel_size=1, groups=1, activation=activation, batch_norm=batch_norm
         )
-
-        self.activation = activation()
         self.batch_norm_f = batch_norm(in_channels)
-        self.batch_norm_dwc = batch_norm(out_channels)
 
     def forward(self, x):
+        # F.relu(x + (self.conv(x)))
         h = self.conv_f(x)
-        h = self.activation(h)
-        h = self.batch_norm_f(x + h)
+        h = h + x
+        # h = self.batch_norm_f(h)
         h = self.conv_dwc(h)
-        h = self.activation(h)
-        h = self.batch_norm_dwc(h)
         return h
 
 
@@ -59,31 +57,35 @@ class Representation(nn.Module):
         Conversion from observation to inner abstract state
     """
 
-    def __init__(self, input_shape, kernel_size=3, activation=nn.ReLU, batch_norm=nn.BatchNorm2d):
+    def __init__(self, input_shape, kernel_size=3, activation=nn.ReLU, batch_norm=nn.BatchNorm2d, avalanche=True):
         super().__init__()
         self.input_shape = input_shape
         self.board_size = self.input_shape[1] * self.input_shape[2]
 
+        modules = []
+
         in_ch = self.input_shape[0]
         out_ch = in_ch * 2
         self.layer0 = Conv(in_ch, out_ch, kernel_size, activation=activation, batch_norm=batch_norm)
-        modules = []
-
         for idx in range(num_blocks):
-            if idx == 0:
-                in_ch = out_ch
-                out_ch = out_ch * 2
-            elif idx < num_blocks - 1:
-                if idx < 4:
+            if avalanche:
+                if idx == 0:
                     in_ch = out_ch
-                    out_ch = in_ch * 2
+                    out_ch = out_ch * 2
+                elif idx < num_blocks - 1:
+                    if idx < 4:
+                        in_ch = out_ch
+                        out_ch = in_ch * 2
+                    else:
+                        in_ch = out_ch
+                        out_ch = int(in_ch / 2)
                 else:
                     in_ch = out_ch
-                    out_ch = int(in_ch / 2)
+                    out_ch = self.input_shape[0]
             else:
-                in_ch = out_ch
-                out_ch = self.input_shape[0]
+                in_ch, out_ch = 2, 2
             modules.append(ResidualBlock(in_ch, out_ch, kernel_size, activation=activation, batch_norm=batch_norm))
+
         self.blocks = nn.ModuleList(modules)
         self.activation = activation()
         self.batch_norm = batch_norm(self.input_shape[0])
@@ -99,7 +101,9 @@ class Prediction(nn.Module):
     """
         Policy and value prediction from inner abstract state
     """
-    def __init__(self, in_channels, action_shape, kernel_size=3, activation=nn.ReLU, batch_norm=nn.BatchNorm2d):
+
+    def __init__(self, in_channels, action_shape, kernel_size=3,
+                 activation=nn.Tanh, batch_norm=nn.BatchNorm2d, avalanche=True):
         super().__init__()
         self.board_size = 42
         self.action_size = action_shape
@@ -123,7 +127,8 @@ class Prediction(nn.Module):
         self.max_pooling = nn.MaxPool2d(2)
         modules = []
         out_ch = in_ch * 2
-        for idx in range(num_blocks):
+        levels = np.floor(np.log2(min(in_channels[-2:]))).astype(int) - 1
+        for idx in range(levels):
             module = nn.Sequential(
                 Conv(in_ch, out_ch, kernel_size=kernel_size, activation=activation, batch_norm=batch_norm),
                 self.max_pooling
@@ -133,7 +138,7 @@ class Prediction(nn.Module):
             out_ch = in_ch * 2
         self.blocks = nn.ModuleList(modules)
 
-        hidden_state = 256
+        hidden_state = in_ch
         # num_point for Bezier curve strategy selection
         self.policy_importance = nn.Linear(hidden_state, self.action_size, bias=False)
         self.classification_levels = []
@@ -163,7 +168,8 @@ class Dynamics(nn.Module):
         Abstruct state transition
     """
 
-    def __init__(self, input_shape, rp_shape, kernel_size=3, activation=nn.ReLU, batch_norm=nn.BatchNorm2d):
+    def __init__(self, input_shape, rp_shape, kernel_size=3, activation=nn.ReLU,
+                 batch_norm=nn.BatchNorm2d, avalanche=True):
         super().__init__()
         self.input_shape = input_shape
         self.rp_shape = rp_shape
@@ -193,11 +199,11 @@ class Dynamics(nn.Module):
         self.blocks = nn.ModuleList(modules)
 
     def forward(self, state, action):
-        # @TODO add curve drawing
-        # h = torch.cat([rp, a], dim=1)
+        h = torch.cat([state, action], dim=1)
         h = self.layer0(state)
         for block in self.blocks:
             h = block(h)
+
         return h
 
 
@@ -205,8 +211,24 @@ class NetworkOutput(typing.NamedTuple):
     value: float
     reward: float
     policy_logits: Dict[Action, float]
-    hidden_state: List[float]
+    hidden_state: List[float] or str
     coordinates: Dict[str, list]
+
+
+def torch2numpy(h):
+    return h.cpu().detach().numpy()
+
+
+def load_image(path):
+    return torch.load(path)
+
+
+def save_image(h):
+    hash_value = sha1(torch2numpy(h)).hexdigest()
+    save_name = f'./states/{hash_value}.ptt'
+    if not os.path.exists(save_name):
+        torch.save(obj=h, f=save_name)
+    return save_name
 
 
 class Network(nn.Module):
@@ -230,6 +252,7 @@ class Network(nn.Module):
 
         x = torch.Tensor(x).to(device)
         h = self.representation(x)
+
         policy, value, coordinates = self.prediction(h)
 
         if orig_x.ndim == 3:
@@ -241,19 +264,25 @@ class Network(nn.Module):
         if x.ndim == 3:
             x = np.expand_dims(x, axis=0) if isinstance(x, numpy.ndarray) else x.unsqueeze(0)
 
-        a = numpy.full(x.shape, a)
-        g = self.dynamics(x, torch.Tensor(a).to(device))
+        a = numpy.full(x.shape, a['action'] if isinstance(a, dict) else a)
+        a = torch.Tensor(a).to(device)
+        g = self.dynamics(x, a)
         policy, value, coordinates = self.prediction(g)
         return g[0], policy[0], value[0], coordinates
 
-    def initial_inference(self, image) -> NetworkOutput:
+    def initial_inference(self, image, return_tensor=False) -> NetworkOutput:
         # representation + prediction function
-        h, p, v, c = self.predict_initial_inference(image.astype(numpy.float32))
+        image = image.astype(numpy.float32)
+        h, p, v, c = self.predict_initial_inference(image)
+        if not return_tensor:
+            h = save_image(h)
         return NetworkOutput(v, 0, p, h, c)
 
-    def recurrent_inference(self, hidden_state, action) -> NetworkOutput:
+    def recurrent_inference(self, hidden_state, action, return_tensor=False) -> NetworkOutput:
         # dynamics + prediction function
         g, p, v, c = self.predict_recurrent_inference(hidden_state, action)
+        if not return_tensor:
+            g = save_image(g)
         return NetworkOutput(v, 0, p, g, c)
 
     def training_steps(self) -> int:

@@ -1,12 +1,18 @@
 import math
+import os.path
+
 import numpy as np
 import cv2
 from PIL import Image
+from hashlib import sha1
 
 try:
     from .globals_ import Player, Winner
 except:
     pass
+
+if not os.path.exists('./states'):
+    os.mkdir('./states')
 
 
 class BezierCurves:
@@ -55,19 +61,19 @@ class BezierCurves:
         return self.bezier_curve_range(self.num_points, points, return_type)
 
 
-def init_target_image(num_samples):
-    img = np.zeros([512, 512])
+def init_target_image(input_format, num_samples):
+    img = np.zeros(input_format)
     x_coords = [0, 0, 100, 100, 0]
     y_coords = [0, 100, 100, 200, 200]
     # img = np.zeros([1200, 1200])
     # x_coords = [300, 700, 800, 200, 1100]
     # y_coords = [700, 500, 1000, 200, 700]
 
-    im2draw = img.copy()
+    im2draw = img.copy()[0]
     color = 255
     thickness = 3
 
-    points = np.stack([x_coords, y_coords]).T + 200
+    points = np.stack([x_coords, y_coords]).T
     num_points = max(int(max(points[:, 0].max() - points[:, 0].min(), points[:, 1].max() - points[:, 1].min()) / 15), 2)
 
     drawer = BezierCurves(num_points=num_points)
@@ -84,8 +90,9 @@ def init_target_image(num_samples):
 class Environment(object):
     """The environment MuZero is interacting with."""
 
-    def __init__(self, action_space=10, original_code=False):
-        target_image = init_target_image(num_samples=12)
+    def __init__(self, configs, original_code=False):
+        self.input_format = configs.input_format
+        target_image = init_target_image(configs.input_format, num_samples=12)
         self.done = False
         self.turn = 0
         self.winner = None
@@ -100,7 +107,7 @@ class Environment(object):
         self.current_reward = self.calc_reward(loss=self.current_loss, prev_loss=self.previous_loss)
 
         self.layers = {}
-        self.action_space = action_space
+        self.action_space = configs.action_space_size
         self.intersection_rate = 0
 
     def calc_loss(self, image, threshold=5):
@@ -125,10 +132,11 @@ class Environment(object):
             else:
                 reward = (prev_loss - loss) / loss
         else:
-            reward = np.exp(np.abs(prev_loss - loss))
-
-            if loss > prev_loss:  # set penalty - reverse reward
-                reward = -reward
+            reward = np.log(np.abs(prev_loss - loss))
+        if reward > 100:
+            print('ahtung!')
+        if loss > prev_loss:  # set penalty - reverse reward
+            reward = -reward
         return reward
 
     def draw_curve(self, points, thickness=3, color=1):
@@ -171,9 +179,19 @@ class Environment(object):
     def legal_actions(self):
         return [i for i in range(self.action_space)]
 
-    def step(self, points, thickness=3, color=255):
-        prev_loss = self.calc_loss(self.current_image)
+    # def load_image(self):
+    #     hash_value = sha1(self.current_image).hexdigest()
+    #     save_name = f'./states/{hash_value}.png'
+    #     return cv2.imread(save_name)
+    #
+    # def save_image(self):
+    #     hash_value = sha1(self.current_image).hexdigest()
+    #     save_name = f'./states/{hash_value}.npy'
+    #     if not os.path.exists(save_name):
+    #         np.save(file=save_name, arr=self.current_image)
 
+    def step(self, action, thickness=3, color=255):
+        points = action['points'].cpu().detach().numpy().astype(int)
         # @TODO color loss
         color_loss = 0
 
@@ -181,7 +199,12 @@ class Environment(object):
         thickness_loss = 0
 
         # lines loss
-        self.current_image = self.draw_curve(points.cpu().detach().numpy().astype(int), thickness, color)
+        points[:, 0] *= self.input_format[-2]
+        points[:, 0] += int(self.input_format[-2] / 2)
+
+        points[:, 1] *= self.input_format[-1]
+        points[:, 1] += int(self.input_format[-1] / 2)
+        self.current_image = self.draw_curve(points, thickness, color)
         self.current_loss = color_loss + thickness_loss + self.calc_loss(self.current_image)
         if abs(self.current_loss) <= 0.1 or self.turn > 1e3:
             self.done = True
@@ -222,7 +245,7 @@ class Environment(object):
 
 def main():
     from PIL import Image
-    Image.fromarray(init_target_image(num_samples=1)).show()
+    Image.fromarray(init_target_image(input_format=(1, 256, 256), num_samples=1)).show()
 
 
 if __name__ == '__main__':

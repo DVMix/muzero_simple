@@ -15,6 +15,8 @@ import numpy
 import torch
 import torch.optim as optim
 import threading
+from hashlib import sha1
+import time
 
 # custom imports
 from muzero_v2.base_utils import Player, Winner, Action, ActionHistory, Node, device, KnownBounds, MinMaxStats
@@ -29,15 +31,15 @@ from muzero_v2.net import Network, NetworkOutput
 class Game(object):
     """A single episode of interaction with the environment."""
 
-    def __init__(self, action_space_size: int, discount: float):
-        self.environment = Environment()
+    def __init__(self, configs):
+        self.environment = Environment(configs)
         self.environment.reset()  # Game specific environment.
         self.history = []
         self.rewards = []
         self.child_visits = []
         self.root_values = []
-        self.action_space_size = action_space_size
-        self.discount = discount
+        self.action_space_size = configs.action_space_size
+        self.discount = configs.discount
         self.canvas_size = self.environment.target_image.shape
 
     def terminal(self) -> bool:
@@ -67,7 +69,7 @@ class Game(object):
 
     def make_image(self, state_index: int):
         # Game specific feature planes.
-        o = Environment().reset()
+        o = self.environment.reset()
 
         for current_index in range(0, state_index):
             o.step(self.history[current_index])
@@ -75,7 +77,7 @@ class Game(object):
         # black_ary, white_ary = o.black_and_white_plane()
         # state = [black_ary, white_ary] if o.player_turn() == Player.black else [white_ary, black_ary]
         # return numpy.array(state)
-        return numpy.expand_dims(self.environment.current_image, axis=0)
+        return numpy.expand_dims(self.environment.current_image, axis=0) / 255
 
     def make_target(self, state_index: int, num_unroll_steps: int, td_steps: int, to_play: Player):
         # The value target is the discounted root value of the search tree N steps
@@ -109,7 +111,8 @@ class Game(object):
 
 class SharedStorage(object):
 
-    def __init__(self):
+    def __init__(self, configs):
+        self.configs = configs
         self._networks = {}
 
     def latest_network(self) -> Network:
@@ -117,14 +120,20 @@ class SharedStorage(object):
             return self._networks[max(self._networks.keys())]
         else:
             # policy -> uniform, value -> 0, reward -> 0
-            return make_uniform_network()
+            return make_uniform_network(
+                action_space_size=self.configs.action_space_size,
+                input_format=self.configs.input_format
+            )
 
     def old_network(self) -> Network:
         if self._networks:
             return self._networks[min(self._networks.keys())]
         else:
             # policy -> uniform, value -> 0, reward -> 0
-            return make_uniform_network()
+            return make_uniform_network(
+                action_space_size=self.configs.action_space_size,
+                input_format=self.configs.input_format
+            )
 
     def save_network(self, step: int, network: Network):
         self._networks[step] = network
@@ -134,6 +143,7 @@ class MuZeroConfig(object):
     def __init__(
             self,
             action_space_size: int,
+            input_format: tuple,
             max_moves: int,
             discount: float,
             dirichlet_alpha: float,
@@ -149,7 +159,7 @@ class MuZeroConfig(object):
         # Self-Play
         self.action_space_size = action_space_size
         self.num_actors = num_actors
-
+        self.input_format = input_format
         self.visit_softmax_temperature_fn = visit_softmax_temperature_fn
         self.max_moves = max_moves
         self.num_simulations = num_simulations
@@ -170,9 +180,9 @@ class MuZeroConfig(object):
         self.known_bounds = known_bounds
 
         # Training
-        self.training_steps = int(1e3)  # 1e6
+        self.training_steps = int(100)  # 1e6
         self.checkpoint_interval = int(100)
-        self.window_size = int(1e3)  # 1e6
+        self.window_size = int(100)  # 1e6
         self.batch_size = batch_size
         self.num_unroll_steps = 4
         self.td_steps = td_steps
@@ -185,8 +195,8 @@ class MuZeroConfig(object):
         self.lr_decay_rate = 0.1
         self.lr_decay_steps = lr_decay_steps
 
-    def new_game(self):
-        return Game(self.action_space_size, self.discount)
+    def new_game(self, configs):
+        return Game(configs=configs)
 
 
 class ReplayBuffer(object):
@@ -204,9 +214,14 @@ class ReplayBuffer(object):
     def sample_batch(self, num_unroll_steps: int, td_steps: int):
         games = [self.sample_game() for _ in range(self.batch_size)]
         game_pos = [(g, self.sample_position(g)) for g in games]
-        return [(g.make_image(i), g.history[i:i + num_unroll_steps],
-                 g.make_target(i, num_unroll_steps, td_steps, g.to_play()))
-                for (g, i) in game_pos]
+        return [
+            (
+                g.make_image(i),
+                g.history[i:i + num_unroll_steps],
+                g.make_target(i, num_unroll_steps, td_steps, g.to_play())
+            )
+            for (g, i) in game_pos
+        ]
 
     def sample_game(self) -> Game:
         # Sample game from buffer either uniformly or according to some priority.
@@ -230,7 +245,7 @@ def vs_random(network, n=100):
     for i in range(n):
         first_turn = i % 2 == 0
         turn = first_turn
-        game = config.new_game()
+        game = config.new_game(config)
         r = 0
         while not game.terminal():
             if turn:
@@ -257,7 +272,7 @@ def vs_random(network, n=100):
 
 def random_vs_random(n=3):  # 100
     results = {}
-    for i in tqdm(range(n)):
+    for i in range(n):
         first_turn = i % 2 == 0
         turn = first_turn
         game = config.new_game()
@@ -324,30 +339,44 @@ def latest_vs_older(last, old, n=100):
 # END: Play modes
 # ----------------------------------------------------------------------------------------------------------------------
 def make_board_game_config(
-        action_space_size: int, max_moves: int, dirichlet_alpha: float, lr_init: float
+        action_space_size: int,
+        input_format: tuple,
+        max_moves: int,
+        dirichlet_alpha: float,
+        lr_init: float
 ) -> MuZeroConfig:
     return MuZeroConfig(
         action_space_size=action_space_size,
+        input_format=input_format,
         max_moves=max_moves,
         discount=1.0,
         dirichlet_alpha=dirichlet_alpha,
         num_simulations=5,  # 10
-        batch_size=8,  # 64
+        batch_size=64,  # 64
         td_steps=max_moves,  # Always use Monte Carlo return.
-        num_actors=1, # 2
+        num_actors=1,  # 2
         lr_init=lr_init,
         lr_decay_steps=100e2,  # 400e3
         visit_softmax_temperature_fn=visit_softmax_temperature,
         known_bounds=KnownBounds(-1, 1))
 
 
-def make_connect4_config() -> MuZeroConfig:
+def make_connect4_config(action_space_size, input_format) -> MuZeroConfig:
     # return make_board_game_config(action_space_size=7, max_moves=20, dirichlet_alpha=0.03, lr_init=0.01)
-    return make_board_game_config(action_space_size=10, max_moves=20, dirichlet_alpha=0.03, lr_init=0.01)
+    return make_board_game_config(
+        action_space_size=action_space_size,
+        input_format=input_format,
+        max_moves=20, dirichlet_alpha=0.03, lr_init=0.01
+    )
 
 
-def make_uniform_network():
-    return Network((1, 512, 512), make_connect4_config().action_space_size).to(device)
+def make_uniform_network(action_space_size, input_format):
+    return Network(
+        input_format,
+        make_connect4_config(
+            action_space_size=action_space_size,
+            input_format=input_format
+        ).action_space_size).to(device)
 
 
 def launch_job(f, *args):
@@ -360,20 +389,20 @@ def muzero(config: MuZeroConfig):
     # These two parts only communicate by transferring the latest network checkpoint
     # from the training to the self-play, and the finished games from the self-play
     # to the training.
-    storage = SharedStorage()
+    storage = SharedStorage(config)
     replay_buffer = ReplayBuffer(config)
 
-    # Start n concurrent actor threads
-    threads = list()
-    for _ in range(config.num_actors):
-        t = threading.Thread(target=launch_job, args=(run_selfplay, config, storage, replay_buffer))
-        threads.append(t)
+    # # Start n concurrent actor threads
+    # threads = list()
+    # for _ in range(config.num_actors):
+    #     t = threading.Thread(target=launch_job, args=(run_selfplay, config, storage, replay_buffer))
+    #     threads.append(t)
+    #
+    # # Start all threads
+    # for x in threads:
+    #     x.start()
 
-    # Start all threads
-    for x in threads:
-        x.start()
-
-    # run_selfplay(config, storage, replay_buffer)
+    run_selfplay(config, storage, replay_buffer)
     train_network(config, storage, replay_buffer)
     return storage.latest_network()
 
@@ -396,13 +425,13 @@ def ucb_score(config: MuZeroConfig, parent: Node, child: Node, min_max_stats: Mi
 
 def select_child(config: MuZeroConfig, node: Node, min_max_stats: MinMaxStats):
     # Select the child with the highest UCB score.
-    _, action, child = max(
+    _, action, child, points = max(
         (
-            ucb_score(config, node, child['policy'], min_max_stats), action, child['policy']
+            ucb_score(config, node, child['policy'], min_max_stats), action, child['policy'], child['points']
         )
         for action, child in node.children.items()
     )
-    return action, child
+    return action, child, points
 
 
 def expand_node(
@@ -416,15 +445,17 @@ def expand_node(
     node.to_play = to_play
     node.hidden_state = network_output.hidden_state
     node.reward = network_output.reward
-    try:
-        policy = {a: math.exp(network_output.policy_logits[a]) for a in actions}
-    except:
-        print(1)
+    policy = {a: math.exp(network_output.policy_logits[a].item()) for a in actions}
     policy_sum = sum(policy.values())
+    h, w = config.input_format[-2:]
     for action, p in policy.items():
+        coord = network_output.coordinates[action].cpu().detach()
+        coord[..., 0] *= w
+        coord[..., 1] *= h
         node.children[action] = {
             'policy': Node(p / policy_sum),
-            'points': network_output.coordinates[action]
+            'action': action,
+            'points': coord  # network_output.coordinates[action]
         }
 
 
@@ -449,7 +480,8 @@ def backpropagate(search_path: List[Node], value: float, to_play: Player, discou
         value = node.reward + discount * value
 
 
-def run_mcts(config: MuZeroConfig, root: Node, action_history: ActionHistory, network: Network):
+def run_mcts(config: MuZeroConfig, root: Node, game: Game, network: Network):
+    action_history =game.action_history()
     # Core Monte Carlo Tree Search algorithm.
     # To decide on an action, we run N simulations, always starting at the root of
     # the search tree and traversing the tree according to the UCB formula until we
@@ -462,15 +494,18 @@ def run_mcts(config: MuZeroConfig, root: Node, action_history: ActionHistory, ne
         search_path = [node]
 
         while node.expanded():
-            action, node = select_child(config, node, min_max_stats)
-            history.add_action(action)
+            action, node, points = select_child(config, node, min_max_stats)
+            # history.add_action(action)
+            history.add_action({'action': action, 'points': points})
             search_path.append(node)
 
         # Inside the search tree we use the dynamics function to obtain the next
         # hidden state given an action and the previous hidden state.
         parent = search_path[-2]
-        network_output = network.recurrent_inference(parent.hidden_state,
-                                                     history.last_action())
+        network_output = network.recurrent_inference(
+            torch.load(parent.hidden_state),
+            history.last_action()
+        )
         expand_node(node, history.to_play(), history.action_space(), network_output)
 
         backpropagate(search_path, network_output.value, history.to_play(),
@@ -491,23 +526,26 @@ def play_game(config: MuZeroConfig, network: Network) -> Game:
     # Each game is produced by starting at the initial board position, then
     # repeatedly executing a Monte Carlo Tree Search to generate moves until the end
     # of the game is reached.
-    game = config.new_game()
-    iter_ = 0
-    while not game.terminal() and len(game.history) < config.max_moves:
-        print(f'Iter #{iter_}')
-        iter_ += 1
+    game = config.new_game(config)
+    # iter_ = 0
+    while not game.terminal() and len(game.history) < config.max_moves:  # config.max_moves
         # At the root of the search tree we use the representation function to
         # obtain a hidden state given the current observation.
+        # print(f'Iter #{iter_}')
+        # iter_ += 1
         root = Node(0)
+        to_play = game.to_play()
+        actions = game.legal_actions()
         current_observation = game.make_image(-1)
-        expand_node(root, game.to_play(), game.legal_actions(), network.initial_inference(current_observation))
+        network_output = network.initial_inference(current_observation)
+        expand_node(node=root, to_play=to_play, actions=actions, network_output=network_output)
         add_exploration_noise(config, root)
 
         # We then run a Monte Carlo Tree Search using only action sequences and the
         # model learned by the network.
-        run_mcts(config, root, game.action_history(), network)
+        run_mcts(config, root, game, network)
         action = select_action(config, len(game.history), root, network)
-        game.apply(root.children[action]['points'])  # action
+        game.apply(root.children[action])  # ['points'] - action
         game.store_search_statistics(root['policy'] if isinstance(root, dict) else root)
     return game
 
@@ -516,10 +554,21 @@ def run_selfplay(config: MuZeroConfig, storage: SharedStorage, replay_buffer: Re
     # Each self-play job is independent of all others; it takes the latest network
     # snapshot, produces a game and makes it available to the training job by
     # writing it to a shared replay buffer.
+    # games_num = 0
+    # games_limit = 5
     while True:
         network = storage.latest_network()
         game = play_game(config, network)
         replay_buffer.save_game(game)
+        if len(replay_buffer.buffer) < config.window_size:
+            print(f'Current ReplayBuffer size = {len(replay_buffer.buffer)}')
+        else:
+            print('sleep for 10 seconds')
+            time.sleep(10)
+        # print(f'Games number = {games_num}')
+        # if games_num == games_limit:
+        #     break
+        # games_num += 1
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -533,14 +582,17 @@ def update_weights(batch, network, optimizer):
     network.train()
     p_loss, v_loss = 0, 0
 
+    # value, rewards, child_visits = targets
+
     for image, actions, targets in batch:
         # Initial step, from the real observation.
-        value, reward, policy_logits, hidden_state = network.initial_inference(image)
+        value, reward, policy_logits, hidden_state, coordinates = network.initial_inference(image, return_tensor=True)
         predictions = [(1.0, value, reward, policy_logits)]
 
         # Recurrent steps, from action and previous hidden state.
         for action in actions:
-            value, reward, policy_logits, hidden_state = network.recurrent_inference(hidden_state, action)
+            result = network.recurrent_inference(hidden_state, action, return_tensor=True)
+            value, reward, policy_logits, hidden_state, coordinates = result
             predictions.append((1.0 / len(actions), value, reward, policy_logits))
 
         for prediction, target in zip(predictions, targets):
@@ -560,7 +612,8 @@ def update_weights(batch, network, optimizer):
 
 
 def train_network(config: MuZeroConfig, storage: SharedStorage, replay_buffer: ReplayBuffer):
-    network = Network()  # network = Network(config.action_space_size).to(device)
+    network = Network(input_shape=config.input_format, action_space_size=config.action_space_size)
+    # network = Network(config.action_space_size).to(device)
     while True:
         optimizer = optim.SGD(
             network.parameters(),
@@ -573,13 +626,13 @@ def train_network(config: MuZeroConfig, storage: SharedStorage, replay_buffer: R
             pass
 
         for i in range(config.training_steps):
-            if i % config.checkpoint_interval == 0 and i > 0:
-                storage.save_network(i, network)
-                # Test against random agent
-                vs_random_once = vs_random(network)
-                print('network_vs_random = ', sorted(vs_random_once.items()), end='\n')
-                vs_older = latest_vs_older(storage.latest_network(), storage.old_network())
-                print('lastnet_vs_older = ', sorted(vs_older.items()), end='\n')
+            # if i % config.checkpoint_interval == 0 and i > 0:
+            #     storage.save_network(i, network)
+            #     # Test against random agent
+            #     vs_random_once = vs_random(network)
+            #     print('network_vs_random = ', sorted(vs_random_once.items()), end='\n')
+            #     vs_older = latest_vs_older(storage.latest_network(), storage.old_network())
+            #     print('lastnet_vs_older = ', sorted(vs_older.items()), end='\n')
             batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
             update_weights(batch, network, optimizer)
         storage.save_network(config.training_steps, network)
@@ -589,6 +642,6 @@ def train_network(config: MuZeroConfig, storage: SharedStorage, replay_buffer: R
 # End Training
 # ----------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
-    config = make_connect4_config()
+    config = make_connect4_config(action_space_size=2, input_format=(1, 32, 32))
     # print('random_vs_random = ', sorted(random_vs_random().items()), end='\n')
     network = muzero(config)
